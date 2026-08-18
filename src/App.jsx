@@ -125,16 +125,18 @@ function computeStats(trades) {
   const rAcumulado = rValues.reduce((a, r) => a + r, 0);
   const rPromedio = rValues.length ? rAcumulado / rValues.length : null;
 
-  // Cumplimiento del plan
-  const conCumplimiento = trades.filter((t) => t.cumplimientoPlan === 'Sí' || t.cumplimientoPlan === 'No');
-  const cumplenSi = trades.filter((t) => t.cumplimientoPlan === 'Sí').length;
-  const cumplimientoPct = conCumplimiento.length ? (cumplenSi / conCumplimiento.length) * 100 : null;
+  // Cumplimiento del plan — ÚNICA FUENTE DE VERDAD: planStatus calculado por el
+  // Risk Engine (normalizado). El campo manual "cumplioPlan" NUNCA alimenta esta
+  // estadística — es solo una reflexión subjetiva del trader, no un dato objetivo.
+  const conEvaluacion = trades.map((t) => normalizePlanStatus(t)).filter((s) => s !== null);
+  const dentroDelPlan = conEvaluacion.filter((s) => s === 'dentro_del_plan').length;
+  const cumplimientoPct = conEvaluacion.length ? (dentroDelPlan / conEvaluacion.length) * 100 : null;
 
   return {
     total, ganadas: ganadas.length, perdidas: perdidas.length, empates: empates.length,
     winrate, pnlTotal, profitFactor, expectativa, rachaG, rachaP, maxDD,
     rAcumulado: conRiesgo.length ? rAcumulado : null, rPromedio, muestraR: conRiesgo.length,
-    cumplimientoPct, muestraCumplimiento: conCumplimiento.length,
+    cumplimientoPct, muestraCumplimiento: conEvaluacion.length,
   };
 }
 
@@ -143,13 +145,17 @@ function groupWinrate(trades, keyFn) {
   trades.forEach((t) => {
     const k = keyFn(t);
     if (!k) return;
-    if (!map[k]) map[k] = { n: 0, g: 0, net: 0 };
+    if (!map[k]) map[k] = { n: 0, g: 0, net: 0, rSum: 0, rN: 0 };
     map[k].n += 1;
     if (t.resultado === 'Ganada') map[k].g += 1;
     map[k].net += netOf(t);
+    if (Number(t.riesgo) > 0) { map[k].rSum += netOf(t) / Number(t.riesgo); map[k].rN += 1; }
   });
   return Object.entries(map)
-    .map(([k, v]) => ({ key: k, n: v.n, winrate: v.n ? (v.g / v.n) * 100 : 0, net: v.net }))
+    .map(([k, v]) => ({
+      key: k, n: v.n, winrate: v.n ? (v.g / v.n) * 100 : 0, net: v.net,
+      rPromedio: v.rN ? v.rSum / v.rN : null, muestraR: v.rN,
+    }))
     .sort((a, b) => b.n - a.n);
 }
 
@@ -160,7 +166,10 @@ function computePatterns(trades) {
     porTemporalidad: groupWinrate(trades, (t) => t.temporalidad),
     porPar: groupWinrate(trades, (t) => t.par),
     porEmocion: groupWinrate(trades, (t) => EMOCIONES.find((e) => e.id === t.emocion)?.label),
-    porCumplimiento: groupWinrate(trades, (t) => t.cumplimientoPlan || null),
+    porCumplimiento: groupWinrate(trades, (t) => {
+      const s = normalizePlanStatus(t);
+      return s ? PLAN_STATUS_LABEL[s]?.text : null;
+    }),
   };
 }
 
@@ -177,7 +186,65 @@ function parseNumeroPlan(str) {
   return { valor: num, esPorcentaje };
 }
 
-function evaluarRiesgo(form, plan, trades) {
+/* ============================================================
+   RIESGO ESTRUCTURADO, MOVIMIENTOS DE CUENTA Y SALDO REAL (V1.1)
+   ============================================================ */
+
+// Compat: plan viejo guardaba "1%" o "$10" como string libre en riesgoPorOperacion.
+// Plan nuevo guarda riskValue (número) + riskUnit ('%'|'USD') estructurados.
+// Esta función lee cualquiera de los dos sin romper datos viejos.
+function getPlanRisk(plan) {
+  if (!plan) return { riskValue: '', riskUnit: '%' };
+  if (plan.riskValue !== undefined && plan.riskValue !== null && plan.riskValue !== '') {
+    return { riskValue: plan.riskValue, riskUnit: plan.riskUnit || '%' };
+  }
+  const legacy = parseNumeroPlan(plan.riesgoPorOperacion);
+  if (legacy) return { riskValue: legacy.valor, riskUnit: legacy.esPorcentaje ? '%' : 'USD' };
+  return { riskValue: '', riskUnit: '%' };
+}
+
+const MOVIMIENTO_TIPOS = [
+  { id: 'deposito', label: 'Depósito', signo: 1 },
+  { id: 'retiro', label: 'Retiro', signo: -1 },
+];
+
+function sumMovimientos(movimientos) {
+  return (movimientos || []).reduce((a, m) => {
+    const signo = m.tipo === 'retiro' ? -1 : 1;
+    return a + signo * (Number(m.monto) || 0);
+  }, 0);
+}
+
+// P&L puro de trading — nunca incluye depósitos/retiros.
+function computePnlTrading(trades) {
+  return trades.reduce((a, t) => a + netOf(t), 0);
+}
+
+// Saldo actual = capital inicial + movimientos + P&L de trading acumulado.
+function computeSaldoActual(plan, trades, movimientos) {
+  const capitalInicial = Number(plan?.capital) || 0;
+  return capitalInicial + sumMovimientos(movimientos) + computePnlTrading(trades);
+}
+
+// Saldo previo a UNA operación puntual (para calcular el % de riesgo de esa
+// operación) = capital inicial + movimientos + P&L de todas las demás
+// operaciones ya registradas, EXCLUYENDO la que se está evaluando ahora.
+function computeSaldoPrevio(plan, trades, movimientos, excludeTradeId) {
+  const capitalInicial = Number(plan?.capital) || 0;
+  const otrasTrades = excludeTradeId ? trades.filter((t) => t.id !== excludeTradeId) : trades;
+  return capitalInicial + sumMovimientos(movimientos) + computePnlTrading(otrasTrades);
+}
+
+// Límite en $ que representa el riesgo máximo por operación, dado el saldo previo.
+function computeLimiteRiesgoUSD(plan, saldoPrevio) {
+  const { riskValue, riskUnit } = getPlanRisk(plan);
+  const v = Number(riskValue);
+  if (!riskValue || isNaN(v) || v <= 0) return null;
+  if (riskUnit === '%') return saldoPrevio > 0 ? (v / 100) * saldoPrevio : null;
+  return v;
+}
+
+function evaluarRiesgo(form, plan, trades, movimientos) {
   const checks = [];
   if (!plan) {
     checks.push({ level: 'warn', text: 'No definiste tu Plan/Riesgo todavía — cargalo para recibir controles automáticos.' });
@@ -189,21 +256,20 @@ function evaluarRiesgo(form, plan, trades) {
   const tradesHoy = trades.filter((t) => t.fecha === hoy && t.id !== form.id);
   const tradesHoyOrdenados = [...tradesHoy].sort((a, b) => (a.hora || '').localeCompare(b.hora || ''));
 
-  // Riesgo máximo por operación
-  const rMax = parseNumeroPlan(plan.riesgoPorOperacion);
-  if (rMax && riesgo > 0) {
-    const capital = Number(plan.capital) || 0;
-    const limite = rMax.esPorcentaje && capital > 0 ? (rMax.valor / 100) * capital : rMax.valor;
-    if (limite > 0) {
-      if (riesgo > limite) checks.push({ level: 'fail', text: `Riesgo de $${riesgo} supera tu máximo por operación ($${limite.toFixed(2)}).` });
-      else checks.push({ level: 'ok', text: 'Riesgo dentro del límite por operación.' });
-    }
+  // Riesgo máximo por operación — sobre saldo previo a esta operación (no sobre capital fijo, no sobre su propio resultado).
+  const saldoPrevio = computeSaldoPrevio(plan, trades, movimientos, form.id);
+  const limite = computeLimiteRiesgoUSD(plan, saldoPrevio);
+  if (limite !== null && riesgo > 0) {
+    if (riesgo > limite) checks.push({ level: 'fail', category: 'riesgo', text: `Riesgo de $${riesgo} supera tu máximo por operación ($${limite.toFixed(2)}, sobre saldo previo de $${saldoPrevio.toFixed(2)}).` });
+    else checks.push({ level: 'ok', category: 'riesgo', text: `Riesgo dentro del límite por operación ($${limite.toFixed(2)}).` });
   } else if (!form.riesgo) {
-    checks.push({ level: 'warn', text: 'No definiste el riesgo en $ de esta operación — no vas a poder medirla en R.' });
+    checks.push({ level: 'warn', category: 'riesgo', text: 'No definiste el riesgo en $ de esta operación — no vas a poder medirla en R.' });
   }
 
   if (!form.stopLoss) {
-    checks.push({ level: 'warn', text: 'No definiste stop loss.' });
+    checks.push({ level: 'warn', category: 'stopLoss', text: 'No definiste stop loss.' });
+  } else {
+    checks.push({ level: 'ok', category: 'stopLoss', text: 'Stop loss definido.' });
   }
 
   // Límite diario
@@ -211,27 +277,30 @@ function evaluarRiesgo(form, plan, trades) {
   if (limiteDiario) {
     const perdidaHoy = tradesHoy.reduce((a, t) => a + (t.resultado === 'Perdida' ? Math.abs(Number(t.monto) || 0) : 0), 0);
     const proyectada = perdidaHoy + (form.resultado === 'Perdida' ? Math.abs(Number(form.monto) || 0) : 0);
-    if (perdidaHoy >= limiteDiario.valor) checks.push({ level: 'fail', text: `Ya alcanzaste tu límite diario de pérdida ($${limiteDiario.valor}).` });
-    else if (proyectada > limiteDiario.valor) checks.push({ level: 'warn', text: 'Esta operación te acercaría o superaría tu límite diario de pérdida.' });
+    if (perdidaHoy >= limiteDiario.valor) checks.push({ level: 'fail', category: 'limiteDiario', text: `Ya alcanzaste tu límite diario de pérdida ($${limiteDiario.valor}).` });
+    else if (proyectada > limiteDiario.valor) checks.push({ level: 'warn', category: 'limiteDiario', text: 'Esta operación te acercaría o superaría tu límite diario de pérdida.' });
   }
 
   // Máximo de operaciones por día
   if (plan.maxOperacionesDia) {
     const max = Number(plan.maxOperacionesDia);
-    if (tradesHoy.length + 1 > max) checks.push({ level: 'fail', text: `Superás tu máximo de operaciones por día (${max}).` });
+    if (tradesHoy.length + 1 > max) checks.push({ level: 'fail', category: 'maxOperaciones', text: `Superás tu máximo de operaciones por día (${max}).` });
   }
 
   // Sesión permitida
   if (plan.horarios && form.sesion) {
     const ok = plan.horarios.toLowerCase().includes(form.sesion.toLowerCase());
-    if (!ok) checks.push({ level: 'warn', text: `La sesión "${form.sesion}" no aparece en tus horarios permitidos ("${plan.horarios}").` });
+    if (!ok) checks.push({ level: 'warn', category: 'sesion', text: `La sesión "${form.sesion}" no aparece en tus horarios permitidos ("${plan.horarios}").` });
+    else checks.push({ level: 'ok', category: 'sesion', text: 'Sesión permitida por tu plan.' });
   }
 
   // Setup válido
   if (plan.setupsValidos) {
-    if (!form.setup) checks.push({ level: 'warn', text: 'No cargaste el setup de esta operación.' });
+    if (!form.setup) checks.push({ level: 'warn', category: 'setup', text: 'No cargaste el setup de esta operación.' });
     else if (!plan.setupsValidos.toLowerCase().includes(form.setup.toLowerCase())) {
-      checks.push({ level: 'fail', text: `El setup "${form.setup}" no está en tu lista de setups válidos.` });
+      checks.push({ level: 'fail', category: 'setup', text: `El setup "${form.setup}" no está en tu lista de setups válidos.` });
+    } else {
+      checks.push({ level: 'ok', category: 'setup', text: 'Setup incluido en tu plan.' });
     }
   }
 
@@ -240,20 +309,86 @@ function evaluarRiesgo(form, plan, trades) {
     const ultima = tradesHoyOrdenados[tradesHoyOrdenados.length - 1];
     const penultima = tradesHoyOrdenados[tradesHoyOrdenados.length - 2];
     if (ultima?.resultado === 'Perdida' && penultima?.resultado === 'Perdida') {
-      checks.push({ level: 'fail', text: `Dos pérdidas consecutivas hoy${plan.reglaTrasDosPerdidas ? ` — tu plan indica: "${plan.reglaTrasDosPerdidas}"` : ': tu plan indica pausa.'}` });
+      checks.push({ level: 'fail', category: 'rachas', text: `Dos pérdidas consecutivas hoy${plan.reglaTrasDosPerdidas ? ` — tu plan indica: "${plan.reglaTrasDosPerdidas}"` : ': tu plan indica pausa.'}` });
     } else if (ultima?.resultado === 'Perdida') {
-      checks.push({ level: 'warn', text: `Venís de una pérdida hoy${plan.reglaTrasPerdida ? ` — tu plan indica: "${plan.reglaTrasPerdida}"` : ': revisá tu estado emocional.'}` });
+      checks.push({ level: 'warn', category: 'rachas', text: `Venís de una pérdida hoy${plan.reglaTrasPerdida ? ` — tu plan indica: "${plan.reglaTrasPerdida}"` : ': revisá tu estado emocional.'}` });
     }
   }
 
-  if (checks.length === 0) checks.push({ level: 'ok', text: 'Cumple con los controles definidos en tu plan.' });
+  if (checks.length === 0) checks.push({ level: 'ok', category: 'plan', text: 'Cumple con los controles definidos en tu plan.' });
   return checks;
 }
 
 function planStatusFromChecks(checks) {
   if (checks.some((c) => c.level === 'fail')) return 'fuera_del_plan';
   if (checks.some((c) => c.level === 'warn')) return 'advertencia';
-  return 'cumple';
+  return 'dentro_del_plan';
+}
+
+// V1.1: normaliza planStatus para trades viejos y nuevos a un único vocabulario.
+// 'cumple' (V1.0) -> 'dentro_del_plan'. Sin evaluar (trades pre-Risk Engine) -> null,
+// nunca se inventa un estado para datos que nunca fueron evaluados.
+function normalizePlanStatus(trade) {
+  if (!trade) return null;
+  if (trade.planStatus === 'cumple') return 'dentro_del_plan';
+  if (trade.planStatus === 'dentro_del_plan' || trade.planStatus === 'advertencia' || trade.planStatus === 'fuera_del_plan') return trade.planStatus;
+  return null;
+}
+
+const PLAN_STATUS_LABEL = {
+  dentro_del_plan: { text: 'DENTRO DEL PLAN', icon: 'ok' },
+  advertencia: { text: 'CON ADVERTENCIAS', icon: 'warn' },
+  fuera_del_plan: { text: 'FUERA DEL PLAN', icon: 'fail' },
+};
+
+/**
+ * Discipline Score V1.1 — determinístico, transparente, sin IA, sin que el
+ * resultado financiero (Ganada/Perdida) influya en nada.
+ *   Componente Plan (70%): dentro_del_plan=100, advertencia=50, fuera_del_plan=0.
+ *   Componente Checklist (30%, solo si esa operación tenía checklist cargado).
+ *   Si no había checklist aplicable, el 100% del peso queda en el Componente Plan.
+ * Devuelve null cuando el trade nunca fue evaluado por el Risk Engine (dato viejo).
+ */
+function computeDisciplineScore(trade) {
+  const status = normalizePlanStatus(trade);
+  if (status === null) return null;
+
+  const planScore = { dentro_del_plan: 100, advertencia: 50, fuera_del_plan: 0 }[status];
+  let checklistScore = null;
+  if (trade.checklistCumplido) {
+    const [done, total] = trade.checklistCumplido.split('/').map(Number);
+    if (total > 0) checklistScore = (done / total) * 100;
+  }
+
+  const score = checklistScore !== null
+    ? Math.round(planScore * 0.7 + checklistScore * 0.3)
+    : Math.round(planScore);
+
+  // Desglose por categoría — solo disponible para trades guardados con el
+  // detalle estructurado nuevo (controlRiesgoDetalle). Para trades viejos,
+  // se muestra únicamente lo que sí se puede saber con certeza: Plan y Checklist.
+  const breakdown = [];
+  const detalle = trade.controlRiesgoDetalle;
+  const CATS = [
+    { cat: 'riesgo', label: 'Riesgo' },
+    { cat: 'setup', label: 'Setup' },
+    { cat: 'sesion', label: 'Sesión' },
+    { cat: 'stopLoss', label: 'Stop loss' },
+  ];
+  if (Array.isArray(detalle) && detalle.length > 0) {
+    CATS.forEach(({ cat, label }) => {
+      const items = detalle.filter((c) => c.category === cat);
+      if (items.length === 0) { breakdown.push({ label, value: 'sin regla definida' }); return; }
+      const peor = items.some((c) => c.level === 'fail') ? 'fail' : items.some((c) => c.level === 'warn') ? 'warn' : 'ok';
+      breakdown.push({ label, value: peor === 'ok' ? 'cumple' : peor === 'warn' ? 'advertencia' : 'fuera del plan' });
+    });
+  } else {
+    breakdown.push({ label: 'Detalle por categoría', value: 'no disponible para operaciones anteriores a esta actualización' });
+  }
+  breakdown.push({ label: 'Plan', value: PLAN_STATUS_LABEL[status]?.text.toLowerCase() || status });
+  breakdown.push({ label: 'Checklist', value: trade.checklistCumplido || 'sin checklist' });
+
+  return { score, breakdown };
 }
 
 function buildTradesContextText(trades) {
@@ -356,6 +491,27 @@ function useAnalisis() {
   return { lista, persist, loaded };
 }
 
+// V1.1 — Depósitos/retiros de cuenta. Clave propia, NUNCA se mezcla con 'trades':
+// las estadísticas de trading (winrate, P&L trading, patrones) jamás leen esto.
+function useMovements() {
+  const [movimientos, setMovimientos] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storage.get('account-movements', false);
+        if (r && r.value) setMovimientos(JSON.parse(r.value));
+      } catch (e) {}
+      setLoaded(true);
+    })();
+  }, []);
+  const persist = async (next) => {
+    setMovimientos(next);
+    try { await storage.set('account-movements', JSON.stringify(next), false); } catch (e) {}
+  };
+  return { movimientos, persist, loaded };
+}
+
 function buildPlanContextText(plan) {
   if (!plan) return 'El usuario todavía no definió su Plan/Riesgo.';
   return `Plan de riesgo definido por Pablo:
@@ -409,14 +565,26 @@ function NoConectado({ texto }) {
    PANTALLA: INICIO
    ============================================================ */
 
-function InicioScreen({ trades, plan, onGoTab }) {
+function InicioScreen({ trades, plan, movimientos, onGoTab }) {
   const hoy = todayISO();
   const tradesHoy = trades.filter((t) => t.fecha === hoy);
   const pnlHoy = tradesHoy.reduce((a, t) => a + netOf(t), 0);
-  const cumplenHoy = tradesHoy.filter((t) => t.cumplimientoPlan === 'Sí').length;
+  const cumplenHoy = tradesHoy.filter((t) => normalizePlanStatus(t) === 'dentro_del_plan').length;
+  const evaluadasHoy = tradesHoy.filter((t) => normalizePlanStatus(t) !== null).length;
   const perdidaHoy = tradesHoy.reduce((a, t) => a + (t.resultado === 'Perdida' ? Math.abs(Number(t.monto) || 0) : 0), 0);
   const limiteDiario = plan?.limiteDiario ? Number(plan.limiteDiario) : null;
   const riesgoDisponible = limiteDiario !== null ? Math.max(0, limiteDiario - perdidaHoy) : null;
+
+  const capitalInicial = Number(plan?.capital) || 0;
+  const pnlTrading = computePnlTrading(trades);
+  const saldoActual = computeSaldoActual(plan, trades, movimientos);
+  const rentabilidad = capitalInicial > 0 ? (pnlTrading / capitalInicial) * 100 : null;
+
+  const stats = useMemo(() => computeStats(trades), [trades]);
+  const ordered = useMemo(() => [...trades].sort((a, b) => (a.fecha + (a.hora || '')).localeCompare(b.fecha + (b.hora || ''))), [trades]);
+  let acumMini = 0;
+  const curvaMini = ordered.map((t, i) => { acumMini += netOf(t); return { x: i + 1, y: Number(acumMini.toFixed(2)) }; });
+  const totalPct = stats.total || 1;
 
   const accesos = [
     { id: 'journal', label: 'Nueva operación', icon: Plus },
@@ -432,11 +600,26 @@ function InicioScreen({ trades, plan, onGoTab }) {
       </div>
 
       <Card>
+        <div style={styles.cardTitle}>Cuenta</div>
+        <div style={styles.statsGrid}>
+          <StatBox label="Saldo actual" value={`$${saldoActual.toFixed(2)}`} />
+          <StatBox label="P&L trading acumulado" value={`${pnlTrading >= 0 ? '+' : ''}$${pnlTrading.toFixed(2)}`} color={pnlTrading >= 0 ? '#4f9c82' : '#c96a4e'} />
+          <StatBox
+            label="Rentabilidad s/ capital inicial"
+            value={rentabilidad !== null ? `${rentabilidad >= 0 ? '+' : ''}${rentabilidad.toFixed(2)}%` : '—'}
+            color={rentabilidad !== null ? (rentabilidad >= 0 ? '#4f9c82' : '#c96a4e') : undefined}
+            sub={rentabilidad === null ? 'definí capital inicial en Plan/Riesgo' : 'no incluye depósitos/retiros'}
+          />
+          <StatBox label="Capital inicial" value={`$${capitalInicial.toFixed(2)}`} />
+        </div>
+      </Card>
+
+      <Card>
         <div style={styles.cardTitle}>Resumen del día — {hoy}</div>
         <div style={styles.statsGrid}>
           <StatBox label="Operaciones" value={tradesHoy.length} />
           <StatBox label="Resultado" value={`${pnlHoy >= 0 ? '+' : ''}$${pnlHoy.toFixed(2)}`} color={pnlHoy >= 0 ? '#4f9c82' : '#c96a4e'} />
-          <StatBox label="Cumplimiento" value={tradesHoy.length ? `${cumplenHoy}/${tradesHoy.length}` : '—'} />
+          <StatBox label="Cumplimiento" value={evaluadasHoy ? `${cumplenHoy}/${evaluadasHoy}` : '—'} />
           <StatBox
             label="Riesgo disponible"
             value={riesgoDisponible !== null ? `$${riesgoDisponible.toFixed(2)}` : '—'}
@@ -444,6 +627,30 @@ function InicioScreen({ trades, plan, onGoTab }) {
             color={riesgoDisponible === 0 ? '#c96a4e' : undefined}
           />
         </div>
+      </Card>
+
+      <Card>
+        <div style={styles.cardTitle}>Rendimiento</div>
+        {stats.total === 0 ? (
+          <div style={styles.emptyMsgSmall}>Todavía no hay operaciones cargadas.</div>
+        ) : (
+          <>
+            {stats.total < 5 && (
+              <div style={styles.aiDisconnectedBanner}><AlertTriangle size={13} /> Muestra insuficiente — n={stats.total}. No saques conclusiones todavía.</div>
+            )}
+            <div style={styles.miniPctRow}>
+              <span style={{ color: '#4f9c82' }}>Ganadas {((stats.ganadas / totalPct) * 100).toFixed(0)}%</span>
+              <span style={{ color: '#e45b68' }}>Perdidas {((stats.perdidas / totalPct) * 100).toFixed(0)}%</span>
+              <span style={{ color: '#5fa8ff' }}>Empates {((stats.empates / totalPct) * 100).toFixed(0)}%</span>
+              <span style={{ color: '#5a6472' }}>n={stats.total}</span>
+            </div>
+            <ResponsiveContainer width="100%" height={70}>
+              <LineChart data={curvaMini}>
+                <Line type="monotone" dataKey="y" stroke="#c9973f" strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </>
+        )}
       </Card>
 
       <Card>
@@ -467,7 +674,7 @@ function InicioScreen({ trades, plan, onGoTab }) {
    PANTALLA: JOURNAL
    ============================================================ */
 
-function JournalScreen({ trades, persist, loaded, plan }) {
+function JournalScreen({ trades, persist, loaded, plan, movimientos }) {
   const [sub, setSub] = useState('nueva');
   const [form, setForm] = useState(emptyForm());
   const [expandedId, setExpandedId] = useState(null);
@@ -477,7 +684,8 @@ function JournalScreen({ trades, persist, loaded, plan }) {
   const fileRef = useRef(null);
 
   const checklistItems = useMemo(() => (plan?.checklist ? plan.checklist.split('\n').map((s) => s.trim()).filter(Boolean) : []), [plan]);
-  const controlRiesgo = useMemo(() => evaluarRiesgo(form, plan, trades), [form, plan, trades]);
+  const controlRiesgo = useMemo(() => evaluarRiesgo(form, plan, trades, movimientos), [form, plan, trades, movimientos]);
+  const saldoPrevioForm = useMemo(() => computeSaldoPrevio(plan, trades, movimientos, form.id), [plan, trades, movimientos, form.id]);
 
   const save = async (e) => {
     e.preventDefault();
@@ -488,7 +696,7 @@ function JournalScreen({ trades, persist, loaded, plan }) {
       : null;
     const entry = {
       ...form, id: form.id || uid(), monto: Number(form.monto), riesgo: form.riesgo ? Number(form.riesgo) : '',
-      planStatus, controlRiesgo: controlRiesgo.map((c) => c.text), checklistCumplido,
+      planStatus, controlRiesgo: controlRiesgo.map((c) => c.text), controlRiesgoDetalle: controlRiesgo, checklistCumplido,
     };
     const next = form.id ? trades.map((t) => (t.id === form.id ? entry : t)) : [entry, ...trades];
     await persist(next);
@@ -586,7 +794,14 @@ function JournalScreen({ trades, persist, loaded, plan }) {
                 <input type="number" step="0.01" min="0" placeholder="0.00" value={form.monto}
                   onChange={(e) => setForm({ ...form, monto: e.target.value })} style={styles.input} required />
               </Field>
-              <Field label="Riesgo arriesgado ($)" hint="opcional — habilita el cálculo en R">
+              <Field label="Riesgo arriesgado ($)" hint={(() => {
+                const lim = computeLimiteRiesgoUSD(plan, saldoPrevioForm);
+                const { riskValue, riskUnit } = getPlanRisk(plan);
+                if (lim === null || !riskValue) return 'opcional — habilita el cálculo en R';
+                return riskUnit === '%'
+                  ? `tu máximo hoy: ${riskValue}% de $${saldoPrevioForm.toFixed(2)} = $${lim.toFixed(2)}`
+                  : `tu máximo definido: $${lim.toFixed(2)}`;
+              })()}>
                 <input type="number" step="0.01" min="0" placeholder="0.00" value={form.riesgo}
                   onChange={(e) => setForm({ ...form, riesgo: e.target.value })} style={styles.input} />
               </Field>
@@ -706,15 +921,19 @@ function JournalScreen({ trades, persist, loaded, plan }) {
           ) : trades.length === 0 ? (
             <div style={styles.emptyMsg}>Todavía no registraste operaciones.</div>
           ) : (
-            trades.map((t) => (
+            trades.map((t) => {
+              const status = normalizePlanStatus(t);
+              const disciplina = computeDisciplineScore(t);
+              return (
               <Card key={t.id} style={{ marginBottom: 10 }}>
                 <div onClick={() => setExpandedId(expandedId === t.id ? null : t.id)} style={styles.histRow}>
                   <span style={{ width: 8, height: 8, borderRadius: 4, background: t.resultado === 'Ganada' ? '#4f9c82' : t.resultado === 'Perdida' ? '#c96a4e' : '#5a6472' }} />
                   <span style={styles.histDate}>{t.fecha}</span>
                   <span style={styles.histPar}>{t.par.split(' ')[0]}</span>
                   <span style={styles.histSesion}>{t.sesion}</span>
-                  {t.planStatus === 'fuera_del_plan' && <XCircle size={13} color="#c96a4e" />}
-                  {t.planStatus === 'advertencia' && <AlertTriangle size={13} color="#c9973f" />}
+                  {status === 'fuera_del_plan' && <XCircle size={13} color="#c96a4e" />}
+                  {status === 'advertencia' && <AlertTriangle size={13} color="#c9973f" />}
+                  {status === 'dentro_del_plan' && <CheckCircle2 size={13} color="#4f9c82" />}
                   {t.demo && <FlaskConical size={12} color="#5a6472" />}
                   <span style={{ ...styles.histMonto, color: t.resultado === 'Ganada' ? '#4f9c82' : t.resultado === 'Perdida' ? '#c96a4e' : '#8a93a3' }}>
                     {t.resultado === 'Perdida' ? '−' : t.resultado === 'Ganada' ? '+' : ''}${t.monto}
@@ -724,8 +943,23 @@ function JournalScreen({ trades, persist, loaded, plan }) {
                 {expandedId === t.id && (
                   <div style={styles.histDetail}>
                     {t.captura && <img src={t.captura} alt="captura operación" style={styles.detailImg} />}
+                    <div style={{
+                      ...styles.planStatusBanner,
+                      borderColor: status === 'fuera_del_plan' ? '#e45b68' : status === 'advertencia' ? '#d4a33f' : status === 'dentro_del_plan' ? '#42c99a' : '#3a4453',
+                      color: status === 'fuera_del_plan' ? '#ff8a92' : status === 'advertencia' ? '#d4a33f' : status === 'dentro_del_plan' ? '#7be0bb' : '#5a6472',
+                    }}>
+                      {status ? (status === 'fuera_del_plan' ? '❌ ' : status === 'advertencia' ? '⚠️ ' : '✅ ') + PLAN_STATUS_LABEL[status].text : 'SIN EVALUAR (operación previa al Risk Engine)'}
+                    </div>
+                    {disciplina && (
+                      <div style={styles.disciplinaBox}>
+                        <div style={styles.disciplinaScore}>Disciplina: {disciplina.score}/100</div>
+                        {disciplina.breakdown.map((b, i) => (
+                          <div key={i} style={styles.disciplinaLine}>· {b.label}: {b.value}</div>
+                        ))}
+                      </div>
+                    )}
                     <div style={styles.detailRow}><span style={styles.detailLabel}>Setup</span><span style={styles.detailVal}>{t.setup || '—'}</span></div>
-                    <div style={styles.detailRow}><span style={styles.detailLabel}>Cumplió plan</span><span style={styles.detailVal}>{t.cumplimientoPlan || '—'}</span></div>
+                    <div style={styles.detailRow}><span style={styles.detailLabel}>Reflexión manual (subjetiva, no estadística)</span><span style={styles.detailVal}>{t.cumplimientoPlan || '—'}</span></div>
                     {t.checklistCumplido && <div style={styles.detailRow}><span style={styles.detailLabel}>Checklist</span><span style={styles.detailVal}>{t.checklistCumplido}</span></div>}
                     <div style={styles.detailRow}><span style={styles.detailLabel}>Notas</span><span style={styles.detailVal}>{t.notas || '—'}</span></div>
                     {t.errores && <div style={styles.detailRow}><span style={styles.detailLabel}>Errores</span><span style={styles.detailVal}>{t.errores}</span></div>}
@@ -743,7 +977,8 @@ function JournalScreen({ trades, persist, loaded, plan }) {
                   </div>
                 )}
               </Card>
-            ))
+              );
+            })
           )}
         </div>
       )}
@@ -758,6 +993,12 @@ function JournalScreen({ trades, persist, loaded, plan }) {
 function RendimientoScreen({ trades }) {
   const stats = useMemo(() => computeStats(trades), [trades]);
   const patterns = useMemo(() => computePatterns(trades), [trades]);
+  const disciplina = useMemo(() => {
+    const scores = trades.map((t) => computeDisciplineScore(t)).filter((d) => d !== null);
+    if (scores.length === 0) return null;
+    const avg = scores.reduce((a, d) => a + d.score, 0) / scores.length;
+    return { avg, n: scores.length, sinEvaluar: trades.length - scores.length };
+  }, [trades]);
 
   const ordered = useMemo(() => [...trades].sort((a, b) => (a.fecha + (a.hora || '')).localeCompare(b.fecha + (b.hora || ''))), [trades]);
   let acum = 0;
@@ -775,6 +1016,7 @@ function RendimientoScreen({ trades }) {
           <span style={styles.patternKey}>{d.key}</span>
           <span style={{ ...styles.patternWr, color: d.winrate >= 50 ? '#4f9c82' : '#c96a4e' }}>{d.winrate.toFixed(0)}%</span>
           <span style={styles.patternN}>n={d.n}{d.n < 5 && ' ⚠'}</span>
+          {d.rPromedio !== null && <span style={styles.patternR}>R {d.rPromedio.toFixed(2)}</span>}
         </div>
       ))}
     </Card>
@@ -800,6 +1042,14 @@ function RendimientoScreen({ trades }) {
           <div style={styles.rNote}>Cumplimiento del plan: {stats.cumplimientoPct.toFixed(0)}% (n={stats.muestraCumplimiento})</div>
         )}
       </Card>
+
+      {disciplina && (
+        <Card>
+          <div style={styles.cardTitle}>Disciplina promedio</div>
+          <div style={styles.disciplinaScore}>{disciplina.avg.toFixed(0)}/100</div>
+          <div style={styles.rNote}>Calculado sobre {disciplina.n} operaciones evaluadas por el Risk Engine{disciplina.sinEvaluar > 0 ? ` (${disciplina.sinEvaluar} sin evaluar, no incluidas)` : ''}. El resultado financiero de cada operación no influye en este número.</div>
+        </Card>
+      )}
 
       <Card>
         <div style={styles.cardTitle}>Curva de resultado acumulado</div>
@@ -1248,16 +1498,55 @@ function emptyPlan() {
   return { capital: '', riesgoPorOperacion: '', limiteDiario: '', limiteSemanal: '', maxOperacionesDia: '', horarios: '', setupsValidos: '', reglaTrasPerdida: '', reglaTrasDosPerdidas: '', checklist: '' };
 }
 
-function PlanScreen({ plan, persist }) {
-  const [form, setForm] = useState(plan || emptyPlan());
-  const [saved, setSaved] = useState(false);
+function emptyMovimiento() {
+  return { tipo: 'deposito', fecha: todayISO(), hora: nowHM(), monto: '', nota: '' };
+}
 
-  useEffect(() => { if (plan) setForm(plan); }, [plan]);
+function PlanScreen({ plan, persist, trades, movimientos, persistMovimientos }) {
+  const [form, setForm] = useState(() => {
+    const base = plan || emptyPlan();
+    const r = getPlanRisk(plan);
+    return { ...base, riskValue: r.riskValue, riskUnit: r.riskUnit };
+  });
+  const [saved, setSaved] = useState(false);
+  const [movForm, setMovForm] = useState(emptyMovimiento());
+
+  useEffect(() => {
+    if (plan) {
+      const r = getPlanRisk(plan);
+      setForm({ ...plan, riskValue: r.riskValue, riskUnit: r.riskUnit });
+    }
+  }, [plan]);
 
   const save = async () => {
-    await persist(form);
+    // Guardamos riskValue/riskUnit estructurados. Conservamos riesgoPorOperacion
+    // (texto legado) sincronizado por compatibilidad hacia atrás, por si algo
+    // externo todavía lo lee, pero ya no es la fuente de verdad.
+    const legacyText = form.riskValue ? `${form.riskValue}${form.riskUnit === '%' ? '%' : ' USD'}` : '';
+    await persist({ ...form, riesgoPorOperacion: legacyText });
     setSaved(true);
     setTimeout(() => setSaved(false), 1400);
+  };
+
+  const saldoActualPreview = computeSaldoActual({ capital: form.capital }, trades, movimientos);
+  const equivalente = (() => {
+    const v = Number(form.riskValue);
+    if (!form.riskValue || isNaN(v) || v <= 0) return null;
+    return form.riskUnit === '%' ? (v / 100) * saldoActualPreview : v;
+  })();
+
+  const movimientosOrdenados = [...movimientos].sort((a, b) => (b.fecha + (b.hora || '')).localeCompare(a.fecha + (a.hora || '')));
+
+  const agregarMovimiento = async () => {
+    if (!movForm.monto || isNaN(Number(movForm.monto)) || Number(movForm.monto) <= 0) return;
+    const entry = { ...movForm, id: uid(), monto: Number(movForm.monto) };
+    await persistMovimientos([entry, ...movimientos]);
+    setMovForm(emptyMovimiento());
+  };
+
+  const borrarMovimiento = async (id) => {
+    if (!window.confirm('¿Borrar este movimiento? No se puede deshacer.')) return;
+    await persistMovimientos(movimientos.filter((m) => m.id !== id));
   };
 
   return (
@@ -1265,13 +1554,26 @@ function PlanScreen({ plan, persist }) {
       <Card>
         <div style={styles.cardTitle}><ShieldCheck size={15} color="#c9973f" /> Plan de riesgo</div>
         <div style={styles.formGrid2}>
-          <Field label="Capital de trading ($)">
+          <Field label="Capital inicial ($)" hint="nunca se modifica automáticamente">
             <input type="number" value={form.capital} onChange={(e) => setForm({ ...form, capital: e.target.value })} style={styles.input} />
           </Field>
-          <Field label="Riesgo máximo por operación">
-            <input type="text" placeholder="Ej: 1% o $10" value={form.riesgoPorOperacion} onChange={(e) => setForm({ ...form, riesgoPorOperacion: e.target.value })} style={styles.input} />
+          <Field label="Saldo actual (calculado)">
+            <div style={styles.readonlyBox}>${saldoActualPreview.toFixed(2)}</div>
           </Field>
         </div>
+        <Field label="Riesgo máximo por operación" hint={equivalente !== null ? `Equivale actualmente a $${equivalente.toFixed(2)} (sobre saldo actual $${saldoActualPreview.toFixed(2)})` : 'cargá un valor para ver a cuánto equivale'}>
+          <div style={styles.riskInputRow}>
+            <input type="number" step="0.01" min="0" placeholder="Ej: 1" value={form.riskValue}
+              onChange={(e) => setForm({ ...form, riskValue: e.target.value })} style={{ ...styles.input, flex: 1 }} />
+            <div style={styles.unitToggle}>
+              {['%', 'USD'].map((u) => (
+                <button type="button" key={u} onClick={() => setForm({ ...form, riskUnit: u })}
+                  className={`jc-btn jc-neutral-sel ${form.riskUnit === u ? 'is-selected' : ''}`}
+                  style={styles.unitBtn}>{u}</button>
+              ))}
+            </div>
+          </div>
+        </Field>
         <div style={styles.formGrid2}>
           <Field label="Límite de pérdida diario ($)">
             <input type="number" value={form.limiteDiario} onChange={(e) => setForm({ ...form, limiteDiario: e.target.value })} style={styles.input} />
@@ -1301,6 +1603,46 @@ function PlanScreen({ plan, persist }) {
         <button onClick={save} className="jc-btn jc-btn-primary" style={styles.saveBtn}>{saved ? <CheckCircle2 size={16} /> : <ShieldCheck size={16} />} {saved ? 'Guardado' : 'Guardar plan'}</button>
       </Card>
       <div style={styles.rNote}>NEXO compara tus operaciones y consultas contra este plan cuando está definido.</div>
+
+      <div style={styles.cardTitle2}>Gestión de cuenta</div>
+      <Card>
+        <div style={styles.formGrid2}>
+          <Field label="Tipo">
+            <div style={styles.toggleRow}>
+              {MOVIMIENTO_TIPOS.map((m) => (
+                <button type="button" key={m.id} onClick={() => setMovForm({ ...movForm, tipo: m.id })}
+                  className={`jc-btn ${m.id === 'deposito' ? 'jc-success' : 'jc-danger'} ${movForm.tipo === m.id ? 'is-selected' : ''}`}
+                  style={styles.toggleBtn}>{m.id === 'deposito' ? '+ Depósito' : '− Retiro'}</button>
+              ))}
+            </div>
+          </Field>
+          <Field label="Monto ($)">
+            <input type="number" step="0.01" min="0" placeholder="0.00" value={movForm.monto}
+              onChange={(e) => setMovForm({ ...movForm, monto: e.target.value })} style={styles.input} />
+          </Field>
+        </div>
+        <Field label="Nota (opcional)">
+          <input type="text" value={movForm.nota} onChange={(e) => setMovForm({ ...movForm, nota: e.target.value })} style={styles.input} />
+        </Field>
+        <button onClick={agregarMovimiento} className="jc-btn jc-btn-primary" style={styles.saveBtn}>
+          <Plus size={16} /> Registrar movimiento
+        </button>
+      </Card>
+
+      {movimientosOrdenados.length > 0 && (
+        <Card>
+          <div style={styles.cardTitle}>Historial de movimientos</div>
+          {movimientosOrdenados.map((m) => (
+            <div key={m.id} style={styles.movRow}>
+              <span style={{ color: m.tipo === 'deposito' ? '#42c99a' : '#e45b68', fontWeight: 600, fontSize: '0.8rem' }}>
+                {m.tipo === 'deposito' ? '+' : '−'}${m.monto}
+              </span>
+              <span style={styles.movMeta}>{m.fecha} {m.hora}{m.nota ? ` · ${m.nota}` : ''}</span>
+              <button onClick={() => borrarMovimiento(m.id)} style={styles.movDeleteBtn}><Trash2 size={13} /></button>
+            </div>
+          ))}
+        </Card>
+      )}
     </div>
   );
 }
@@ -1378,7 +1720,7 @@ function ConfiguracionScreen({ trades, persistTrades }) {
   };
 
   const exportar = async () => {
-    const keys = ['trades', 'plan-riesgo', 'analisis', 'bot-chat-history'];
+    const keys = ['trades', 'plan-riesgo', 'analisis', 'bot-chat-history', 'account-movements'];
     const out = {};
     for (const k of keys) {
       try { const r = await storage.get(k, false); if (r && r.value) out[k] = JSON.parse(r.value); } catch (e) {}
@@ -1464,6 +1806,7 @@ export default function JournalCapitalApp() {
   const { trades, persist: persistTrades, loaded: tradesLoaded } = useTrades();
   const { plan, persist: persistPlan } = usePlan();
   const { lista: analisisLista, persist: persistAnalisis } = useAnalisis();
+  const { movimientos, persist: persistMovimientos } = useMovements();
   const enTabsMas = TABS_MAS.some((t) => t.id === tab);
 
   const irA = (id) => { setTab(id); setMasAbierto(false); };
@@ -1516,12 +1859,12 @@ export default function JournalCapitalApp() {
       </header>
 
       <main style={styles.main}>
-        {tab === 'inicio' && <InicioScreen trades={trades} plan={plan} onGoTab={setTab} />}
-        {tab === 'journal' && <JournalScreen trades={trades} persist={persistTrades} loaded={tradesLoaded} plan={plan} />}
+        {tab === 'inicio' && <InicioScreen trades={trades} plan={plan} movimientos={movimientos} onGoTab={setTab} />}
+        {tab === 'journal' && <JournalScreen trades={trades} persist={persistTrades} loaded={tradesLoaded} plan={plan} movimientos={movimientos} />}
         {tab === 'analizar' && <AnalizarScreen trades={trades} persist={persistTrades} analisisLista={analisisLista} persistAnalisis={persistAnalisis} />}
         {tab === 'rendimiento' && <RendimientoScreen trades={trades} />}
         {tab === 'nexo' && <NexoScreen trades={trades} plan={plan} />}
-        {tab === 'plan' && <PlanScreen plan={plan} persist={persistPlan} />}
+        {tab === 'plan' && <PlanScreen plan={plan} persist={persistPlan} trades={trades} movimientos={movimientos} persistMovimientos={persistMovimientos} />}
         {tab === 'calendario' && (
           <StubScreen icon={Calendar} titulo="Calendario"
             descripcion="Organización diaria y semanal de tu operativa: qué sesiones operar, revisión del día, notas asociadas a operaciones."
@@ -1633,6 +1976,18 @@ const styles = {
   detailLabel: { color: '#5a6472', flexShrink: 0 },
   detailVal: { color: '#c9c4b5', textAlign: 'right' },
   detailActions: { display: 'flex', gap: 8, marginTop: 10 },
+  planStatusBanner: { fontSize: '0.78rem', fontWeight: 600, border: '1px solid', borderRadius: 7, padding: '8px 11px', marginBottom: 10, letterSpacing: '0.02em' },
+  disciplinaBox: { background: '#0d1117', border: '1px solid #1f2733', borderRadius: 7, padding: '10px 12px', marginBottom: 10 },
+  disciplinaScore: { fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: '0.86rem', color: '#c9973f', marginBottom: 6 },
+  disciplinaLine: { fontSize: '0.74rem', color: '#8a93a3', lineHeight: 1.6 },
+  readonlyBox: { background: '#131a24', border: '1px solid #2a3441', borderRadius: 7, padding: '10px 12px', color: '#c9973f', fontSize: '0.9rem', fontWeight: 600, fontFamily: "'Space Grotesk', sans-serif" },
+  riskInputRow: { display: 'flex', gap: 8 },
+  unitToggle: { display: 'flex', gap: 6, flexShrink: 0 },
+  unitBtn: { padding: '10px 12px', borderRadius: 7, fontSize: '0.8rem' },
+  movRow: { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: '1px solid #1f2733' },
+  movMeta: { flex: 1, fontSize: '0.72rem', color: '#5a6472', fontFamily: "'IBM Plex Mono', monospace" },
+  movDeleteBtn: { width: 26, height: 26, borderRadius: 6, background: '#0d1117', border: '1px solid #2a3441', color: '#8a93a3', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' },
+  miniPctRow: { display: 'flex', flexWrap: 'wrap', gap: 12, fontSize: '0.76rem', fontWeight: 600, marginBottom: 8, fontFamily: "'IBM Plex Mono', monospace" },
   smallBtn: { display: 'flex', alignItems: 'center', gap: 5, padding: '7px 11px', background: '#0d1117', border: '1px solid #2a3441', borderRadius: 6, color: '#8a93a3', fontSize: '0.75rem', cursor: 'pointer' },
 
   statsGrid: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 },
@@ -1646,6 +2001,7 @@ const styles = {
   patternKey: { flex: 1, color: '#c9c4b5' },
   patternWr: { fontWeight: 600, width: 44, textAlign: 'right' },
   patternN: { color: '#5a6472', fontSize: '0.7rem', width: 48, textAlign: 'right' },
+  patternR: { color: '#8a93a3', fontSize: '0.7rem', fontFamily: "'IBM Plex Mono', monospace", width: 50, textAlign: 'right' },
   sampleWarning: { display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.72rem', color: '#5a6472', marginTop: 6, marginBottom: 20 },
 
   noConectado: { display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.74rem', color: '#5a6472', background: '#0d1117', border: '1px dashed #2a3441', borderRadius: 7, padding: '8px 10px', marginBottom: 8 },
