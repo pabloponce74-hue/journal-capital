@@ -1,10 +1,62 @@
-# Journal Capital Trading — V1.2 (Análisis multitemporal dinámico)
+# Journal Capital Trading — V1.2.1 (Correcciones de testing real)
 
-**Estado: V1.2 lista para testing real en navegador. NO validada.**
-V1.1 sí está validada (probada en Vercel, confirmado manualmente) y es la
-BASE ESTABLE. V1.2 parte de esa base sin tocarla — es una copia de
-desarrollo separada, no reemplaza el deploy hasta que la prueben y decidan
-promoverla a mano.
+**Estado: V1.2.1 lista para testing real en navegador. NO validada.**
+V1.1 sigue siendo la BASE ESTABLE (validada en Vercel). V1.2 fue testeada
+en móvil y de ahí salieron 3 hallazgos concretos — esta build los corrige.
+Nada de esto está confirmado hasta que ustedes lo prueben en el navegador.
+
+## Qué corrige V1.2.1 (basado en el testing real de V1.2)
+
+**1. Selector de temporalidad en Android.** El `<select>` nativo con 18
+opciones no se manejaba bien en Android — costaba llegar a las
+temporalidades menores. Se reemplazó por chips táctiles (el mismo patrón
+que ya usan las emociones en Journal), todos visibles y tocables sin
+scroll de un select nativo. Ninguna opción cambió — siguen siendo las
+mismas 17 + "Personalizada".
+
+**2. Texto del botón de guardado.** Decía "Guardar análisis en Journal",
+pero el análisis nunca crea una operación ni aparece en el Historial de
+Journal — solo queda en "Análisis guardados" dentro de Analizar. El texto
+ahora dice **"Guardar análisis"**, sin prometer una integración que no
+existe todavía (eso queda para una fase futura, no implementada acá).
+
+**3. Detalle de análisis guardado.** Antes, tocar un análisis guardado no
+hacía nada. Ahora se expande igual que una operación en el Historial de
+Journal, mostrando: fecha, par, cada temporalidad guardada con su captura
+y su comentario individual, el contexto/hipótesis general, y el resultado
+de IA si existiera. Es de **solo lectura** — no se agregó edición todavía.
+También muestra correctamente los análisis viejos guardados en formato
+V1.1 (sin romperlos).
+
+**Lo que NO cambió (verificado por diff línea a línea, no solo por
+memoria):** confirmé con un diff completo contra V1.2 que el cambio está
+100% contenido dentro de `AnalizarScreen` — Journal, Rendimiento,
+Plan/Riesgo, Risk Engine, Pattern Engine, Discipline Score, NEXO,
+navegación y el selector de temporalidad de Journal quedaron exactamente
+iguales. No se conectó IA, voz ni backend.
+
+**Confirmación de compilación:** `npm install && npm run build` real en
+este entorno — compiló sin errores (2298 módulos). Sigue sin ser lo mismo
+que probarlo en un navegador de verdad.
+
+## Cómo probar V1.2.1 manualmente
+
+1. Andá a **Analizar** en un celular Android (el bug original era ahí).
+2. Agregá una temporalidad y confirmá que ahora ves **chips** en vez de un
+   select desplegable, y que podés tocar directamente 1M, 45M, 1W, etc.
+   sin tener que abrir y scrollear un menú largo.
+3. Cargá una captura y un comentario en un par de bloques, más el
+   "Contexto / hipótesis" general.
+4. Confirmá que el botón dice **"Guardar análisis"** (no "...en Journal").
+5. Guardalo. Andá a **Journal** → Historial y confirmá que **no** apareció
+   ninguna operación nueva ahí — es el comportamiento esperado.
+6. Volvé a Analizar, tocá el análisis recién guardado en "Análisis
+   guardados" — debe expandirse mostrando cada temporalidad con su
+   captura y comentario, más el contexto general.
+7. Si tenés algún análisis viejo guardado desde V1.2 (formato con
+   `timeframes`/`imagenes`), confirmá que también se puede expandir sin
+   romperse, aunque se vea más simple (sin comentario individual, porque
+   ese formato viejo no lo tenía).
 
 ## Qué cambia en V1.2 respecto a V1.1
 

@@ -1122,6 +1122,7 @@ function AnalizarScreen({ trades, persist, analisisLista, persistAnalisis }) {
   const [loading, setLoading] = useState(false);
   const [resultado, setResultado] = useState(null);
   const [saved, setSaved] = useState(false);
+  const [expandedAnalisisId, setExpandedAnalisisId] = useState(null);
   const fileRefs = useRef({});
 
   const agregarBloque = () => {
@@ -1214,9 +1215,13 @@ function AnalizarScreen({ trades, persist, analisisLista, persistAnalisis }) {
             </div>
 
             <Field label="Temporalidad">
-              <select value={b.temporalidad} onChange={(e) => actualizarBloque(b.id, { temporalidad: e.target.value })} style={styles.input}>
-                {TIMEFRAME_OPCIONES.map((tf) => <option key={tf} value={tf}>{tf}</option>)}
-              </select>
+              <div style={styles.chipRow}>
+                {TIMEFRAME_OPCIONES.map((tf) => (
+                  <button type="button" key={tf} onClick={() => actualizarBloque(b.id, { temporalidad: tf })}
+                    className={`jc-btn jc-neutral-sel ${b.temporalidad === tf ? 'is-selected' : ''}`}
+                    style={styles.chip}>{tf}</button>
+                ))}
+              </div>
             </Field>
 
             {b.temporalidad === 'Personalizada' && (
@@ -1268,7 +1273,7 @@ function AnalizarScreen({ trades, persist, analisisLista, persistAnalisis }) {
           <div style={styles.cardTitle}>Resultado del análisis</div>
           <div style={styles.analisisText}>{resultado}</div>
           <button onClick={guardarEnJournal} disabled={saved} className="jc-btn jc-btn-primary" style={{ ...styles.saveBtn, marginTop: 12 }}>
-            <CheckCircle2 size={16} /> {saved ? 'Guardado' : 'Guardar análisis en Journal'}
+            <CheckCircle2 size={16} /> {saved ? 'Guardado' : 'Guardar análisis'}
           </button>
         </Card>
       )}
@@ -1279,16 +1284,52 @@ function AnalizarScreen({ trades, persist, analisisLista, persistAnalisis }) {
           {analisisLista.slice(0, 5).map((a) => {
             // Compat V1.1 -> V1.2: entradas viejas guardaron 'timeframes' (array
             // de strings) + 'imagenes' (objeto); las nuevas guardan 'bloques'.
-            const etiquetas = Array.isArray(a.bloques)
+            const esNuevo = Array.isArray(a.bloques);
+            const etiquetas = esNuevo
               ? a.bloques.map((b) => b.temporalidad).join(', ')
               : Array.isArray(a.timeframes) ? a.timeframes.join(', ') : '—';
+            const expanded = expandedAnalisisId === a.id;
             return (
               <Card key={a.id} style={{ marginBottom: 10 }}>
-                <div style={styles.histRow}>
+                <div onClick={() => setExpandedAnalisisId(expanded ? null : a.id)} style={styles.histRow}>
                   <span style={styles.histDate}>{a.fecha}</span>
                   <span style={styles.histPar}>{a.par.split(' ')[0]}</span>
                   <span style={styles.histSesion}>{etiquetas}</span>
+                  {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
                 </div>
+                {expanded && (
+                  <div style={styles.histDetail}>
+                    <div style={styles.detailRow}><span style={styles.detailLabel}>Par</span><span style={styles.detailVal}>{a.par}</span></div>
+                    {a.contexto && (
+                      <div style={{ marginBottom: 10 }}>
+                        <div style={styles.detailLabel}>Contexto / hipótesis general</div>
+                        <div style={styles.controlRiesgoTextSmall}>{a.contexto}</div>
+                      </div>
+                    )}
+                    {esNuevo ? (
+                      a.bloques.map((b) => (
+                        <div key={b.id} style={styles.bloqueAnalisis}>
+                          <div style={styles.bloqueAnalisisTitle}>{b.temporalidad}</div>
+                          {b.imagen && <img src={b.imagen} alt={b.temporalidad} style={styles.detailImg} />}
+                          {b.comentario && <div style={styles.controlRiesgoTextSmall}>{b.comentario}</div>}
+                        </div>
+                      ))
+                    ) : (
+                      (a.timeframes || []).map((tf) => (
+                        <div key={tf} style={styles.bloqueAnalisis}>
+                          <div style={styles.bloqueAnalisisTitle}>{tf}</div>
+                          {a.imagenes && a.imagenes[tf] && <img src={a.imagenes[tf]} alt={tf} style={styles.detailImg} />}
+                        </div>
+                      ))
+                    )}
+                    {a.resultado && (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={styles.detailLabel}>Resultado IA</div>
+                        <div style={styles.analisisText}>{a.resultado}</div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </Card>
             );
           })}
