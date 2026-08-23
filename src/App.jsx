@@ -15,6 +15,11 @@ import { callAI, AI_CONNECTED } from './aiService';
 const PARES = ['AUD/NZD OTC', 'EUR/USD OTC', 'GBP/USD OTC', 'USD/JPY OTC', 'EUR/JPY OTC', 'USD/CAD OTC', 'Otro'];
 const SESIONES = ['Mañana', 'Mediodía', 'Tarde'];
 const TEMPORALIDADES = ['4H', '1H', '15M', '5M', '1M'];
+
+// V1.2 — exclusiva del módulo Analizar. NO reemplaza a TEMPORALIDADES:
+// esa sigue siendo la usada por el selector de temporalidad de Journal y
+// por el generador de datos demo, y no se toca en esta iteración.
+const TIMEFRAME_OPCIONES = ['1M', '2M', '3M', '5M', '10M', '15M', '30M', '45M', '1H', '2H', '3H', '4H', '6H', '8H', '12H', '1D', '1W', 'Personalizada'];
 const EMOCIONES = [
   { id: 'calma', label: 'Calma' },
   { id: 'confianza', label: 'Confianza' },
@@ -82,6 +87,17 @@ const emptyForm = () => ({
   aprendizaje: '',
   notas: '',
   captura: null,
+});
+
+// V1.2 — un bloque independiente del módulo Analizar: temporalidad, captura
+// y comentario quedan atados por el mismo id, sin ambigüedad, para que el
+// asistente IA (cuando se conecte) pueda usarlos sin confundir uno con otro.
+const emptyBloqueAnalisis = () => ({
+  id: uid(),
+  temporalidad: '15M',
+  temporalidadCustom: '',
+  imagen: null,
+  comentario: '',
 });
 
 const netOf = (t) => (t.resultado === 'Perdida' ? -Math.abs(Number(t.monto) || 0) : t.resultado === 'Ganada' ? Math.abs(Number(t.monto) || 0) : 0);
@@ -1100,37 +1116,56 @@ Conclusión educativa: resumen breve para ayudarlo a pensar mejor, no para decid
 La decisión final siempre es del operador.`;
 
 function AnalizarScreen({ trades, persist, analisisLista, persistAnalisis }) {
-  const [imagenes, setImagenes] = useState({}); // { '4H': dataUrl, ... }
+  const [bloques, setBloques] = useState([]);
   const [par, setPar] = useState(PARES[0]);
   const [contexto, setContexto] = useState('');
   const [loading, setLoading] = useState(false);
   const [resultado, setResultado] = useState(null);
   const [saved, setSaved] = useState(false);
+  const [expandedAnalisisId, setExpandedAnalisisId] = useState(null);
   const fileRefs = useRef({});
 
-  const onPick = async (tf, e) => {
+  const agregarBloque = () => {
+    setBloques((prev) => [...prev, emptyBloqueAnalisis()]);
+  };
+
+  const actualizarBloque = (id, cambios) => {
+    setBloques((prev) => prev.map((b) => (b.id === id ? { ...b, ...cambios } : b)));
+  };
+
+  const eliminarBloque = (id) => {
+    setBloques((prev) => prev.filter((b) => b.id !== id));
+    delete fileRefs.current[id];
+  };
+
+  const onPickImagen = async (id, e) => {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
     const dataUrl = await resizeImage(file, 1100, 0.8);
-    setImagenes((prev) => ({ ...prev, [tf]: dataUrl }));
+    actualizarBloque(id, { imagen: dataUrl });
     e.target.value = '';
   };
 
-  const timeframesUsados = TEMPORALIDADES.filter((tf) => imagenes[tf]);
+  // Etiqueta final de la temporalidad de un bloque: si eligió "Personalizada",
+  // usa lo que haya escrito; si no, la opción tal cual. Esto es lo único que
+  // se persiste — nunca se guarda ambigüedad entre la opción elegida y el texto libre.
+  const labelTemporalidad = (b) => (b.temporalidad === 'Personalizada' ? (b.temporalidadCustom || 'Personalizada') : b.temporalidad);
+
+  const bloquesConImagen = bloques.filter((b) => b.imagen);
 
   const analizar = async () => {
-    if (timeframesUsados.length === 0) return;
+    if (bloquesConImagen.length === 0) return;
     setLoading(true);
     setResultado(null);
     setSaved(false);
     try {
       const content = [];
-      timeframesUsados.forEach((tf) => {
-        const match = imagenes[tf].match(/^data:(image\/\w+);base64,(.+)$/);
+      bloquesConImagen.forEach((b) => {
+        const match = b.imagen.match(/^data:(image\/\w+);base64,(.+)$/);
         content.push({ type: 'image', source: { type: 'base64', media_type: match[1], data: match[2] } });
-        content.push({ type: 'text', text: `↑ Captura correspondiente a temporalidad ${tf}.` });
+        content.push({ type: 'text', text: `↑ Captura correspondiente a temporalidad ${labelTemporalidad(b)}.${b.comentario ? ` Comentario del operador sobre esta captura: ${b.comentario}` : ''}` });
       });
-      content.push({ type: 'text', text: `Par: ${par}. Contexto/hipótesis del operador: ${contexto || 'no especificado'}.` });
+      content.push({ type: 'text', text: `Par: ${par}. Contexto/hipótesis general del operador: ${contexto || 'no especificado'}.` });
 
       const res = await callAI({
         system: ANALISIS_SYSTEM_PROMPT,
@@ -1149,10 +1184,9 @@ function AnalizarScreen({ trades, persist, analisisLista, persistAnalisis }) {
       id: uid(),
       fecha: todayISO(),
       par,
-      timeframes: timeframesUsados,
       contexto,
       resultado,
-      imagenes,
+      bloques: bloques.map((b) => ({ id: b.id, temporalidad: labelTemporalidad(b), imagen: b.imagen, comentario: b.comentario })),
     };
     await persistAnalisis([entry, ...analisisLista]);
     setSaved(true);
@@ -1173,31 +1207,63 @@ function AnalizarScreen({ trades, persist, analisisLista, persistAnalisis }) {
           </select>
         </Field>
 
-        <div style={styles.tfGrid}>
-          {TEMPORALIDADES.map((tf) => (
-            <div key={tf} style={styles.tfSlot}>
-              <input ref={(el) => (fileRefs.current[tf] = el)} type="file" accept="image/*" onChange={(e) => onPick(tf, e)} style={{ display: 'none' }} />
-              {imagenes[tf] ? (
-                <div style={{ position: 'relative' }}>
-                  <img src={imagenes[tf]} alt={tf} style={styles.tfThumb} />
-                  <button onClick={() => setImagenes((p) => { const n = { ...p }; delete n[tf]; return n; })} style={styles.thumbX}><X size={12} /></button>
+        {bloques.map((b, i) => (
+          <div key={b.id} style={styles.bloqueAnalisis}>
+            <div style={styles.bloqueAnalisisHeader}>
+              <span style={styles.bloqueAnalisisTitle}>Temporalidad #{i + 1}</span>
+              <button type="button" onClick={() => eliminarBloque(b.id)} style={styles.movDeleteBtn}><Trash2 size={13} /></button>
+            </div>
+
+            <Field label="Temporalidad">
+              <div style={styles.chipRow}>
+                {TIMEFRAME_OPCIONES.map((tf) => (
+                  <button type="button" key={tf} onClick={() => actualizarBloque(b.id, { temporalidad: tf })}
+                    className={`jc-btn jc-neutral-sel ${b.temporalidad === tf ? 'is-selected' : ''}`}
+                    style={styles.chip}>{tf}</button>
+                ))}
+              </div>
+            </Field>
+
+            {b.temporalidad === 'Personalizada' && (
+              <Field label="Nombre de la temporalidad personalizada">
+                <input type="text" placeholder="Ej: 4H heikin-ashi" value={b.temporalidadCustom}
+                  onChange={(e) => actualizarBloque(b.id, { temporalidadCustom: e.target.value })} style={styles.input} />
+              </Field>
+            )}
+
+            <Field label="Captura del gráfico">
+              <input ref={(el) => (fileRefs.current[b.id] = el)} type="file" accept="image/*" onChange={(e) => onPickImagen(b.id, e)} style={{ display: 'none' }} />
+              {b.imagen ? (
+                <div style={{ position: 'relative', width: 120 }}>
+                  <img src={b.imagen} alt={labelTemporalidad(b)} style={styles.bloqueThumb} />
+                  <button type="button" onClick={() => actualizarBloque(b.id, { imagen: null })} style={styles.thumbX}><X size={12} /></button>
                 </div>
               ) : (
-                <button onClick={() => fileRefs.current[tf].click()} style={styles.tfBtn}>
-                  <ImagePlus size={16} />
+                <button type="button" onClick={() => fileRefs.current[b.id].click()} style={styles.captureBtn}>
+                  <ImagePlus size={15} /> Adjuntar captura
                 </button>
               )}
-              <span style={styles.tfLabel}>{tf}</span>
-            </div>
-          ))}
+            </Field>
+
+            <Field label="Comentario / análisis individual (opcional)">
+              <textarea rows={2} placeholder="Qué ves en esta temporalidad puntual..." value={b.comentario}
+                onChange={(e) => actualizarBloque(b.id, { comentario: e.target.value })} style={{ ...styles.input, resize: 'vertical' }} />
+            </Field>
+          </div>
+        ))}
+
+        <button type="button" onClick={agregarBloque} className="jc-btn jc-neutral-sel is-selected" style={{ ...styles.saveBtn, marginTop: bloques.length ? 4 : 0 }}>
+          <Plus size={16} /> Agregar temporalidad
+        </button>
+
+        <div style={{ marginTop: 16 }}>
+          <Field label="Contexto / hipótesis (opcional)" hint="interpretación global del análisis multitemporal — independiente de los comentarios de cada temporalidad">
+            <textarea rows={2} placeholder="Qué estás viendo en conjunto, qué hipótesis tenés..." value={contexto}
+              onChange={(e) => setContexto(e.target.value)} style={{ ...styles.input, resize: 'vertical' }} />
+          </Field>
         </div>
 
-        <Field label="Contexto / hipótesis (opcional)">
-          <textarea rows={2} placeholder="Qué estás viendo, qué hipótesis tenés..." value={contexto}
-            onChange={(e) => setContexto(e.target.value)} style={{ ...styles.input, resize: 'vertical' }} />
-        </Field>
-
-        <button onClick={analizar} disabled={loading || timeframesUsados.length === 0} className="jc-btn jc-btn-primary" style={styles.saveBtn}>
+        <button onClick={analizar} disabled={loading || bloquesConImagen.length === 0} className="jc-btn jc-btn-primary" style={styles.saveBtn}>
           {loading ? <Loader2 size={16} style={{ animation: 'spin 1s linear infinite' }} /> : <ScanEye size={16} />} {loading ? 'Analizando…' : 'Analizar'}
         </button>
       </Card>
@@ -1207,7 +1273,7 @@ function AnalizarScreen({ trades, persist, analisisLista, persistAnalisis }) {
           <div style={styles.cardTitle}>Resultado del análisis</div>
           <div style={styles.analisisText}>{resultado}</div>
           <button onClick={guardarEnJournal} disabled={saved} className="jc-btn jc-btn-primary" style={{ ...styles.saveBtn, marginTop: 12 }}>
-            <CheckCircle2 size={16} /> {saved ? 'Guardado' : 'Guardar análisis en Journal'}
+            <CheckCircle2 size={16} /> {saved ? 'Guardado' : 'Guardar análisis'}
           </button>
         </Card>
       )}
@@ -1215,15 +1281,58 @@ function AnalizarScreen({ trades, persist, analisisLista, persistAnalisis }) {
       {analisisLista.length > 0 && (
         <>
           <div style={styles.cardTitle2}>Análisis guardados</div>
-          {analisisLista.slice(0, 5).map((a) => (
-            <Card key={a.id} style={{ marginBottom: 10 }}>
-              <div style={styles.histRow}>
-                <span style={styles.histDate}>{a.fecha}</span>
-                <span style={styles.histPar}>{a.par.split(' ')[0]}</span>
-                <span style={styles.histSesion}>{a.timeframes.join(', ')}</span>
-              </div>
-            </Card>
-          ))}
+          {analisisLista.slice(0, 5).map((a) => {
+            // Compat V1.1 -> V1.2: entradas viejas guardaron 'timeframes' (array
+            // de strings) + 'imagenes' (objeto); las nuevas guardan 'bloques'.
+            const esNuevo = Array.isArray(a.bloques);
+            const etiquetas = esNuevo
+              ? a.bloques.map((b) => b.temporalidad).join(', ')
+              : Array.isArray(a.timeframes) ? a.timeframes.join(', ') : '—';
+            const expanded = expandedAnalisisId === a.id;
+            return (
+              <Card key={a.id} style={{ marginBottom: 10 }}>
+                <div onClick={() => setExpandedAnalisisId(expanded ? null : a.id)} style={styles.histRow}>
+                  <span style={styles.histDate}>{a.fecha}</span>
+                  <span style={styles.histPar}>{a.par.split(' ')[0]}</span>
+                  <span style={styles.histSesion}>{etiquetas}</span>
+                  {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+                </div>
+                {expanded && (
+                  <div style={styles.histDetail}>
+                    <div style={styles.detailRow}><span style={styles.detailLabel}>Par</span><span style={styles.detailVal}>{a.par}</span></div>
+                    {a.contexto && (
+                      <div style={{ marginBottom: 10 }}>
+                        <div style={styles.detailLabel}>Contexto / hipótesis general</div>
+                        <div style={styles.controlRiesgoTextSmall}>{a.contexto}</div>
+                      </div>
+                    )}
+                    {esNuevo ? (
+                      a.bloques.map((b) => (
+                        <div key={b.id} style={styles.bloqueAnalisis}>
+                          <div style={styles.bloqueAnalisisTitle}>{b.temporalidad}</div>
+                          {b.imagen && <img src={b.imagen} alt={b.temporalidad} style={styles.detailImg} />}
+                          {b.comentario && <div style={styles.controlRiesgoTextSmall}>{b.comentario}</div>}
+                        </div>
+                      ))
+                    ) : (
+                      (a.timeframes || []).map((tf) => (
+                        <div key={tf} style={styles.bloqueAnalisis}>
+                          <div style={styles.bloqueAnalisisTitle}>{tf}</div>
+                          {a.imagenes && a.imagenes[tf] && <img src={a.imagenes[tf]} alt={tf} style={styles.detailImg} />}
+                        </div>
+                      ))
+                    )}
+                    {a.resultado && (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={styles.detailLabel}>Resultado IA</div>
+                        <div style={styles.analisisText}>{a.resultado}</div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
         </>
       )}
     </div>
@@ -2017,6 +2126,10 @@ const styles = {
   tfBtn: { width: '100%', aspectRatio: '1', background: '#0d1117', border: '1px dashed #2a3441', borderRadius: 7, color: '#5a6472', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' },
   tfThumb: { width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 7, border: '1px solid #2a3441' },
   tfLabel: { fontSize: '0.62rem', color: '#8a93a3', fontFamily: "'IBM Plex Mono', monospace" },
+  bloqueAnalisis: { background: '#0d1117', border: '1px solid #1f2733', borderRadius: 9, padding: '13px 14px', marginBottom: 12 },
+  bloqueAnalisisHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 },
+  bloqueAnalisisTitle: { fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: '0.8rem', color: '#c9c4b5' },
+  bloqueThumb: { width: 120, aspectRatio: '1', objectFit: 'cover', borderRadius: 7, border: '1px solid #2a3441', display: 'block' },
   analisisText: { fontSize: '0.85rem', lineHeight: 1.6, color: '#e8e4da', whiteSpace: 'pre-wrap' },
 
   nexoWrap: { display: 'flex', flexDirection: 'column', height: '100%' },

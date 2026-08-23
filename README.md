@@ -1,7 +1,183 @@
-# Journal Capital Trading — V1 local
+# Journal Capital Trading — V1.2.1 (Correcciones de testing real)
 
-Versión React real (fuera del artifact de Claude), migrada para correr en tu
-propia PC con Vite.
+**Estado: V1.2.1 lista para testing real en navegador. NO validada.**
+V1.1 sigue siendo la BASE ESTABLE (validada en Vercel). V1.2 fue testeada
+en móvil y de ahí salieron 3 hallazgos concretos — esta build los corrige.
+Nada de esto está confirmado hasta que ustedes lo prueben en el navegador.
+
+## Qué corrige V1.2.1 (basado en el testing real de V1.2)
+
+**1. Selector de temporalidad en Android.** El `<select>` nativo con 18
+opciones no se manejaba bien en Android — costaba llegar a las
+temporalidades menores. Se reemplazó por chips táctiles (el mismo patrón
+que ya usan las emociones en Journal), todos visibles y tocables sin
+scroll de un select nativo. Ninguna opción cambió — siguen siendo las
+mismas 17 + "Personalizada".
+
+**2. Texto del botón de guardado.** Decía "Guardar análisis en Journal",
+pero el análisis nunca crea una operación ni aparece en el Historial de
+Journal — solo queda en "Análisis guardados" dentro de Analizar. El texto
+ahora dice **"Guardar análisis"**, sin prometer una integración que no
+existe todavía (eso queda para una fase futura, no implementada acá).
+
+**3. Detalle de análisis guardado.** Antes, tocar un análisis guardado no
+hacía nada. Ahora se expande igual que una operación en el Historial de
+Journal, mostrando: fecha, par, cada temporalidad guardada con su captura
+y su comentario individual, el contexto/hipótesis general, y el resultado
+de IA si existiera. Es de **solo lectura** — no se agregó edición todavía.
+También muestra correctamente los análisis viejos guardados en formato
+V1.1 (sin romperlos).
+
+**Lo que NO cambió (verificado por diff línea a línea, no solo por
+memoria):** confirmé con un diff completo contra V1.2 que el cambio está
+100% contenido dentro de `AnalizarScreen` — Journal, Rendimiento,
+Plan/Riesgo, Risk Engine, Pattern Engine, Discipline Score, NEXO,
+navegación y el selector de temporalidad de Journal quedaron exactamente
+iguales. No se conectó IA, voz ni backend.
+
+**Confirmación de compilación:** `npm install && npm run build` real en
+este entorno — compiló sin errores (2298 módulos). Sigue sin ser lo mismo
+que probarlo en un navegador de verdad.
+
+## Cómo probar V1.2.1 manualmente
+
+1. Andá a **Analizar** en un celular Android (el bug original era ahí).
+2. Agregá una temporalidad y confirmá que ahora ves **chips** en vez de un
+   select desplegable, y que podés tocar directamente 1M, 45M, 1W, etc.
+   sin tener que abrir y scrollear un menú largo.
+3. Cargá una captura y un comentario en un par de bloques, más el
+   "Contexto / hipótesis" general.
+4. Confirmá que el botón dice **"Guardar análisis"** (no "...en Journal").
+5. Guardalo. Andá a **Journal** → Historial y confirmá que **no** apareció
+   ninguna operación nueva ahí — es el comportamiento esperado.
+6. Volvé a Analizar, tocá el análisis recién guardado en "Análisis
+   guardados" — debe expandirse mostrando cada temporalidad con su
+   captura y comentario, más el contexto general.
+7. Si tenés algún análisis viejo guardado desde V1.2 (formato con
+   `timeframes`/`imagenes`), confirmá que también se puede expandir sin
+   romperse, aunque se vea más simple (sin comentario individual, porque
+   ese formato viejo no lo tenía).
+
+## Qué cambia en V1.2 respecto a V1.1
+
+**Único objetivo de esta versión:** el módulo Analizar deja de tener 5
+casilleros fijos de temporalidad (4H/1H/15M/5M/1M) y pasa a un sistema
+dinámico de bloques.
+
+- Botón **"+ Agregar temporalidad"** en vez de la grilla fija.
+- Cada bloque agregado es independiente y tiene: selector de temporalidad
+  (17 opciones: 1M, 2M, 3M, 5M, 10M, 15M, 30M, 45M, 1H, 2H, 3H, 4H, 6H, 8H,
+  12H, 1D, 1W, o "Personalizada" con texto libre), su propia captura, su
+  propio comentario individual, y un botón para eliminarlo.
+- Se pueden agregar **varias temporalidades a la vez, incluso repetidas**
+  (ej. dos bloques de 15M con capturas y comentarios distintos) — cada uno
+  tiene su propio id, sin mezclarse entre sí.
+- El campo **"Contexto / hipótesis"** general se mantiene, y sigue siendo
+  independiente de los comentarios de cada bloque — es la interpretación
+  global, no una más de las individuales.
+- Cada bloque guarda su captura y su comentario atados por el mismo id, así
+  que si más adelante se conecta NEXO a un análisis real, no hay ambigüedad
+  sobre qué comentario corresponde a qué imagen.
+
+**Compatibilidad con lo ya guardado:** si en V1.1 llegaste a guardar algún
+análisis de prueba (formato viejo: `timeframes` + `imagenes`), la lista
+"Análisis guardados" lo sigue mostrando sin romperse — se detecta el
+formato viejo y el nuevo por separado, nada se migra a la fuerza.
+
+**Lo que NO cambió en esta versión (verificado explícitamente):**
+Journal, Rendimiento, Plan/Riesgo, Risk Engine, Pattern Engine, Discipline
+Score, NEXO, navegación, y el selector de temporalidad de Journal (que usa
+una constante distinta y separada de la del módulo Analizar — ambas
+conviven en el código sin pisarse). Tampoco se conectó IA, voz ni backend.
+
+**Confirmación de compilación:** corrí `npm install && npm run build` real
+sobre este proyecto en este mismo entorno de trabajo y compiló sin errores
+(2298 módulos, build de producción generado correctamente). Esto es más
+fuerte que una revisión estática de código, pero sigue sin ser lo mismo que
+probarlo en un navegador real — no reemplaza el testing manual de ustedes.
+
+## Cómo probar V1.2 manualmente
+
+1. Seguí los pasos A-H de más abajo (instalación y `npm run dev`) para
+   levantarla local, o desplegala en un proyecto de Vercel aparte (no el de
+   producción) para probarla desde el celular.
+2. Andá a la pestaña **Analizar**.
+3. Tocá **"+ Agregar temporalidad"** dos o tres veces seguidas.
+4. En un bloque, elegí **15M**; en otro, elegí **15M** de nuevo (repetida a
+   propósito) — confirmá que ambos bloques quedan separados, cada uno con
+   su propia captura y comentario, sin pisarse.
+5. En otro bloque, elegí **"Personalizada"** y escribí un nombre propio
+   (ej. "4H heikin-ashi") — confirmá que aparece el campo de texto y que
+   se guarda ese nombre, no la palabra "Personalizada".
+6. Adjuntá una captura distinta a cada bloque y escribí un comentario
+   distinto en cada uno.
+7. Eliminá uno de los bloques con el botón de basura — confirmá que
+   desaparece solo ese, sin afectar a los demás.
+8. Completá el campo general "Contexto / hipótesis" y confirmá que es un
+   campo aparte, no se mezcla con los comentarios individuales.
+9. Tocá "Analizar" (va a mostrar "Análisis IA no conectado" — es
+   esperado, todavía no se conectó IA) y después "Guardar análisis en
+   Journal".
+10. Recargá la página y confirmá que el análisis guardado sigue apareciendo
+    en "Análisis guardados", con las temporalidades correctas listadas.
+11. Andá a **Journal** → Nueva operación y confirmá que el selector de
+    temporalidad ahí sigue mostrando solo las 5 opciones de siempre
+    (4H/1H/15M/5M/1M) — no debería haberse contaminado con las 17 nuevas.
+12. Cargá datos demo desde Configuración y confirmá que las operaciones
+    demo se generan igual que antes (con una de esas 5 temporalidades).
+
+## Qué cambia en V1.1 respecto a V1.0
+
+**El bug de cumplimiento está corregido.** Antes, "Cumplimiento del plan"
+en Rendimiento leía el campo manual (`cumplioPlan`, Sí/No que vos tildás a
+mano). Ahora lee exclusivamente `planStatus`, calculado por el Risk Engine
+(`evaluarRiesgo`) — el campo manual sigue existiendo como reflexión
+subjetiva tuya, pero ya no alimenta ninguna estadística, ni el Pattern
+Engine, ni el Discipline Score. Una operación puede ser GANADA y
+FUERA DEL PLAN al mismo tiempo — el resultado financiero nunca cambia el
+`planStatus`.
+
+**Riesgo estructurado (% o USD).** Plan/Riesgo ahora tiene un campo
+numérico + un selector de unidad, en vez de un texto libre ambiguo tipo
+`"1%"`. El riesgo porcentual se calcula sobre el **saldo previo a esa
+operación puntual** (capital inicial + movimientos + P&L de las demás
+operaciones ya registradas) — nunca sobre un capital fijo ni sobre el
+resultado de la operación que se está evaluando. Se muestra siempre el
+equivalente en $ en vivo.
+
+**Saldo real vs P&L de trading — separados a propósito.**
+```
+P&L Trading      = suma exclusiva de resultados de operaciones
+Saldo Actual     = capital inicial + depósitos − retiros + P&L Trading
+Rentabilidad     = P&L Trading / capital inicial × 100   (sobre capital inicial,
+                   NO incluye depósitos/retiros en el numerador)
+```
+Un depósito nunca aparece como ganancia de trading, y un retiro nunca
+aparece como pérdida de trading.
+
+**Gestión de cuenta.** Nueva sección en Plan/Riesgo con `+ Depósito` /
+`− Retiro`. Cada movimiento guarda id, fecha, hora, tipo, monto y nota
+opcional. Se guardan en una clave propia, `account-movements`, separada de
+`trades` — las estadísticas de trading nunca las leen.
+
+**Discipline Score (0–100), determinístico, sin IA.**
+```
+Componente Plan (70%):      dentro_del_plan=100, advertencia=50, fuera_del_plan=0
+Componente Checklist (30%): 100 × (ítems tildados / ítems totales)
+Si no había checklist aplicable, el 100% del peso queda en el Componente Plan.
+```
+El resultado financiero (Ganada/Perdida/$) nunca entra en esta fórmula.
+Se muestra el desglose (Riesgo, Setup, Sesión, Stop loss, Checklist) cuando
+está disponible; para operaciones guardadas antes de esta actualización,
+el desglose por categoría se marca honestamente como "no disponible" en
+vez de inventarse.
+
+**Compatibilidad hacia atrás — nada se reescribe a la fuerza.**
+- `planStatus` viejo (`'cumple'`) se interpreta como `'dentro_del_plan'` al leerlo, sin tocar el dato guardado.
+- `riesgoPorOperacion` viejo (texto tipo `"1%"`) se sigue leyendo si todavía no existe `riskValue`/`riskUnit`.
+- Un backup V1.0 (sin `account-movements`) se importa igual — esa clave simplemente queda en `[]`, no rompe nada.
+- Ninguna clave de `localStorage` cambió de nombre: `trades`, `plan-riesgo`, `analisis`, `bot-chat-history`, y la nueva `account-movements`.
+
 
 ## Qué funciona hoy y qué no
 
@@ -126,54 +302,39 @@ físicamente distintos — no se copian solos. Para pasarlos:
 
 ---
 
-## Testing V1
+## Testing V1.1 — RISK & PERFORMANCE
 
-Distingo dos niveles, porque no es lo mismo:
-
-- **VERIFICADO ESTÁTICAMENTE** = revisé el código (sintaxis, balance de
-  JSX, props, referencias) sin ejecutarlo en un navegador real. Da
-  confianza de que no hay errores obvios, pero no reemplaza probarlo.
-- **PROBADO EN NAVEGADOR** = lo corriste vos con `npm run dev` y lo
-  clickeaste. Solo esto confirma que funciona de verdad.
-
-Todo lo de abajo está, hasta ahora, en estado **VERIFICADO ESTÁTICAMENTE**.
-Nada está marcado como "probado en navegador" todavía — eso lo completás
-vos (o lo hacemos juntos en la próxima sesión) siguiendo esta lista:
+Igual criterio que antes: **VERIFICADO ESTÁTICAMENTE** (revisé sintaxis,
+balance, props, referencias, sin ejecutar en navegador) vs **PROBADO EN
+NAVEGADOR** (lo corrieron ustedes y lo clickearon). Todo lo de V1.0 sigue
+en pie. Lo nuevo de V1.1, abajo — todo en estado "Sin probar", a propósito:
+no voy a declarar nada validado sin que ustedes lo confirmen en Vercel/local.
 
 | # | Prueba | Estado | Resultado esperado | Resultado real | Bug | Prioridad |
 |---|--------|--------|---------------------|-----------------|-----|-----------|
-| 1 | Navegación entre Inicio/Journal/Analizar/Rendimiento/NEXO/Más | Sin probar | Cambia de pantalla sin errores | — | — | — |
-| 2 | Menú "Más" abre Plan/Riesgo, Calendario, Aprender, Configuración | Sin probar | Se despliega y navega bien | — | — | — |
-| 3 | Crear operación completa (todos los campos + detalle avanzado) | Sin probar | Se guarda y aparece en Historial | — | — | — |
-| 4 | Compra/Venta, Ganada/Perdida/Empate, Sí/No — un solo seleccionado a la vez | Sin probar | Selección inequívoca, un solo activo | — | — | — |
-| 5 | Cargar Plan/Riesgo de prueba (capital 1000, riesgo 1%, límite diario 30, etc.) | Sin probar | Se guarda y persiste tras cerrar/reabrir | — | — | — |
-| 6 | Operación dentro del plan | Sin probar | Control de riesgo: ✅ Cumple | — | — | — |
-| 7 | Operación con riesgo excesivo | Sin probar | ❌ Fuera del plan | — | — | — |
-| 8 | Operación en sesión no permitida | Sin probar | ⚠️/❌ según corresponda | — | — | — |
-| 9 | Operación con setup no válido | Sin probar | ❌ Fuera del plan | — | — | — |
-| 10 | Operación GANADA pero fuera del plan | Sin probar | resultado=Ganada, planStatus=fuera_del_plan (no se mezclan) | — | — | — |
-| 11 | Operación PERDIDA pero dentro del plan | Sin probar | resultado=Perdida, planStatus=cumple | — | — | — |
-| 12 | Dos pérdidas consecutivas → tercera operación | Sin probar | Aparece advertencia/regla de pausa | — | — | — |
-| 13 | Rendimiento: métricas y gráficos | Sin probar | Coinciden con cálculo manual | — | — | — |
-| 14 | Cargar datos demo (~25 operaciones) | Sin probar | Aparecen marcadas, no rompen nada | — | — | — |
-| 15 | Borrar datos demo | Sin probar | Desaparecen solo las demo, reales intactas | — | — | — |
-| 16 | Exportar backup (Vite) | Sin probar | Se descarga JSON válido | — | — | — |
-| 17 | Importar backup (de artifact a Vite) | Sin probar | Datos recuperados correctamente | — | — | — |
-| 18 | NEXO: los 6 modos son seleccionables | Sin probar | Cambian sin error | — | — | — |
-| 19 | NEXO: enviar consulta | Sin probar | Muestra "NEXO AI no conectado" (no simula respuesta) | — | — | — |
-| 20 | Analizar: adjuntar capturas por temporalidad | Sin probar | Preview funciona, botón Analizar muestra "no conectado" | — | — | — |
-| 21 | Voz: dictado (mic) | Sin probar | Pide permiso de mic real y transcribe (Chrome) | — | — | — |
-| 22 | Voz: lectura en voz alta | Sin probar | Lee el texto en es-AR | — | — | — |
-| 23 | Persistencia tras cerrar navegador y reabrir | Sin probar | Trades, plan, análisis, historial NEXO siguen ahí | — | — | — |
-| 24 | Responsive: desktop 1920×1080, laptop 1366×768, mobile ~390×844 | Sin probar | Nada se corta, "Más" funciona, capturas se ven bien | — | — | — |
+| A | Ganada + dentro del plan | Sin probar | resultado=Ganada, planStatus=dentro_del_plan | — | — | — |
+| B | Ganada + fuera del plan | Sin probar | resultado=Ganada, planStatus=fuera_del_plan (no se mezclan) | — | — | — |
+| C | Perdida + dentro del plan | Sin probar | resultado=Perdida, planStatus=dentro_del_plan | — | — | — |
+| D | Perdida + fuera del plan | Sin probar | resultado=Perdida, planStatus=fuera_del_plan | — | — | — |
+| E | Riesgo máximo definido en % | Sin probar | Se calcula sobre saldo previo, no sobre capital fijo; muestra equivalente en $ | — | — | — |
+| F | Riesgo máximo definido en USD | Sin probar | Compara directo contra el monto en $ | — | — | — |
+| G | Depósito | Sin probar | Se guarda en account-movements, Saldo actual sube, P&L Trading NO cambia | — | — | — |
+| H | Retiro | Sin probar | Se guarda en account-movements, Saldo actual baja, P&L Trading NO cambia | — | — | — |
+| I | Persistencia tras cerrar navegador | Sin probar | trades, plan, movimientos, análisis, historial NEXO siguen ahí | — | — | — |
+| J | Datos de la V1 desplegada siguen funcionando | Sin probar | Trades viejos visibles, planStatus 'cumple' se ve como "DENTRO DEL PLAN" | — | — | — |
+| K | Cumplimiento correcto | Sin probar | % de Rendimiento coincide con planStatus, no con el campo manual | — | — | — |
+| L | Discipline Score | Sin probar | Score 0-100 visible por operación, desglose determinístico, resultado financiero no lo altera | — | — | — |
+| M | Estadísticas (winrate, P&L, profit factor, expectativa, drawdown, rachas, R) | Sin probar | Coinciden con cálculo manual | — | — | — |
+| N | Pattern Engine (por cumplimiento, incluyendo R promedio cuando hay riesgo cargado) | Sin probar | "Dentro del plan"/"Fuera del plan" con winrate + n correctos | — | — | — |
+| O | Exportar backup V1.1 | Sin probar | El JSON incluye trades, plan-riesgo, analisis, bot-chat-history, account-movements | — | — | — |
+| P | Importar backup V1.1 | Sin probar | Todos los datos, incluidos movimientos, se recuperan | — | — | — |
+| Q | Importar backup V1.0 (sin account-movements) | Sin probar | Importa igual; movimientos queda en [] sin romper nada | — | — | — |
 
 **Prioridades:** P0 = rompe app/datos · P1 = funcionalidad importante rota ·
 P2 = problema de UX · P3 = mejora visual.
 
 **Regla acordada:** no se agregan funciones nuevas mientras haya bugs P0 o P1
 sin resolver.
-
----
 
 ## Próximo paso (cuando esta V1 pase las pruebas)
 
